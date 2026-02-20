@@ -9,6 +9,7 @@ struct BudgetDetailView: View {
     @State private var isEditingLimit = false
     @State private var limitText = ""
     @State private var showDeleteAlert = false
+    @State private var showRolloverPicker = false
 
     private var relatedTransactions: [Transaction] {
         vm.transactions.filter { $0.category == budget.category && $0.isExpense }
@@ -26,6 +27,11 @@ struct BudgetDetailView: View {
                     budgetStat(label: "Limit", value: budget.limit.asCurrency, color: .blue)
                     budgetStat(label: "Spent", value: budget.spent.asCurrency, color: budget.isOverBudget ? .red : .orange)
                     budgetStat(label: "Remaining", value: budget.remaining.asCurrency, color: budget.isOverBudget ? .red : .green)
+                }
+
+                // Rollover Card
+                if budget.rolloverEnabled {
+                    rolloverCard
                 }
 
                 // Daily Spending Chart
@@ -47,6 +53,17 @@ struct BudgetDetailView: View {
                         limitText = String(budget.limit)
                         isEditingLimit = true
                     }
+                    Divider()
+                    Button(budget.rolloverEnabled ? "Disable Rollover" : "Enable Rollover") {
+                        budget.rolloverEnabled.toggle()
+                        vm.updateBudget(budget)
+                    }
+                    if budget.rolloverEnabled {
+                        Button("Change Rollover Mode") {
+                            showRolloverPicker = true
+                        }
+                    }
+                    Divider()
                     Button("Delete Budget", role: .destructive) {
                         showDeleteAlert = true
                     }
@@ -72,6 +89,19 @@ struct BudgetDetailView: View {
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog("Rollover Mode", isPresented: $showRolloverPicker, titleVisibility: .visible) {
+            Button("Carry Forward Remaining") {
+                budget.rolloverMode = .carryForward
+                vm.updateBudget(budget)
+            }
+            Button("Reset Each Month") {
+                budget.rolloverMode = .resetEachMonth
+                vm.updateBudget(budget)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("How should unused budget carry into the next month?")
         }
     }
 
@@ -100,6 +130,41 @@ struct BudgetDetailView: View {
         }
         .frame(width: 160, height: 160)
         .padding()
+    }
+
+    // MARK: - Rollover Card
+    private var rolloverCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Rollover", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.headline)
+                Spacer()
+                Text(budget.rolloverMode == .carryForward ? "Carry Forward" : "Reset Monthly")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Color(.systemGray5))
+                    .cornerRadius(8)
+            }
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Rollover Balance").font(.caption).foregroundColor(.secondary)
+                    Text(budget.rolloverBalance.asCurrency)
+                        .font(.subheadline.bold())
+                        .foregroundColor(budget.rolloverBalance >= 0 ? .green : .red)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("Effective Limit").font(.caption).foregroundColor(.secondary)
+                    Text((budget.limit + budget.rolloverBalance).asCurrency)
+                        .font(.subheadline.bold())
+                }
+            }
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(16)
     }
 
     // MARK: - Budget Stat

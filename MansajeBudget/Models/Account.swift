@@ -6,6 +6,7 @@ enum AccountType: String, Codable, CaseIterable {
     case credit
     case investment
     case loan
+    case mortgage
     case other
 
     var displayName: String {
@@ -15,6 +16,7 @@ enum AccountType: String, Codable, CaseIterable {
         case .credit:      return "Credit Card"
         case .investment:  return "Investment"
         case .loan:        return "Loan"
+        case .mortgage:    return "Mortgage"
         case .other:       return "Other"
         }
     }
@@ -26,9 +28,12 @@ enum AccountType: String, Codable, CaseIterable {
         case .credit:      return "creditcard"
         case .investment:  return "chart.line.uptrend.xyaxis"
         case .loan:        return "doc.text"
+        case .mortgage:    return "house.fill"
         case .other:       return "ellipsis.circle"
         }
     }
+
+    var isLiability: Bool { self == .credit || self == .loan || self == .mortgage }
 }
 
 struct Account: Identifiable, Codable {
@@ -36,35 +41,49 @@ struct Account: Identifiable, Codable {
     var name: String
     var type: AccountType
     var balance: Double
+    var availableBalance: Double?
     var institutionName: String
     var institutionLogo: String?   // URL string
     var mask: String?              // Last 4 digits
     var userId: String
     var plaidAccountId: String?
     var lastUpdated: Date
+    var isHidden: Bool
+    var isHiddenFromBudgets: Bool
+    var isClosed: Bool
+
+    var displayBalance: Double { availableBalance ?? balance }
 
     init(
         id: String = UUID().uuidString,
         name: String,
         type: AccountType,
         balance: Double,
+        availableBalance: Double? = nil,
         institutionName: String,
         institutionLogo: String? = nil,
         mask: String? = nil,
         userId: String,
         plaidAccountId: String? = nil,
-        lastUpdated: Date = Date()
+        lastUpdated: Date = Date(),
+        isHidden: Bool = false,
+        isHiddenFromBudgets: Bool = false,
+        isClosed: Bool = false
     ) {
         self.id = id
         self.name = name
         self.type = type
         self.balance = balance
+        self.availableBalance = availableBalance
         self.institutionName = institutionName
         self.institutionLogo = institutionLogo
         self.mask = mask
         self.userId = userId
         self.plaidAccountId = plaidAccountId
         self.lastUpdated = lastUpdated
+        self.isHidden = isHidden
+        self.isHiddenFromBudgets = isHiddenFromBudgets
+        self.isClosed = isClosed
     }
 }
 
@@ -77,11 +96,15 @@ extension Account {
             "balance": balance,
             "institutionName": institutionName,
             "userId": userId,
-            "lastUpdated": lastUpdated
+            "lastUpdated": lastUpdated,
+            "isHidden": isHidden,
+            "isHiddenFromBudgets": isHiddenFromBudgets,
+            "isClosed": isClosed
         ]
         if let logo = institutionLogo { data["institutionLogo"] = logo }
         if let mask = mask { data["mask"] = mask }
         if let plaidId = plaidAccountId { data["plaidAccountId"] = plaidId }
+        if let avail = availableBalance { data["availableBalance"] = avail }
         return data
     }
 
@@ -100,12 +123,16 @@ extension Account {
             name: name,
             type: type,
             balance: balance,
+            availableBalance: data["availableBalance"] as? Double,
             institutionName: institutionName,
             institutionLogo: data["institutionLogo"] as? String,
             mask: data["mask"] as? String,
             userId: userId,
             plaidAccountId: data["plaidAccountId"] as? String,
-            lastUpdated: (data["lastUpdated"] as? Date) ?? Date()
+            lastUpdated: (data["lastUpdated"] as? Date) ?? Date(),
+            isHidden: data["isHidden"] as? Bool ?? false,
+            isHiddenFromBudgets: data["isHiddenFromBudgets"] as? Bool ?? false,
+            isClosed: data["isClosed"] as? Bool ?? false
         )
     }
 }

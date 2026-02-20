@@ -7,6 +7,7 @@ struct TransactionDetailView: View {
     @State var transaction: Transaction
     @State private var isEditing = false
     @State private var showDeleteAlert = false
+    @State private var showSplitSheet = false
 
     // Edit state
     @State private var editName = ""
@@ -35,14 +36,21 @@ struct TransactionDetailView: View {
                         .font(.system(size: 44, weight: .bold, design: .rounded))
                         .foregroundColor(transaction.isExpense ? .primary : .green)
 
-                    if transaction.isPending {
-                        Label("Pending", systemImage: "clock.fill")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 4)
-                            .background(Color.orange.opacity(0.15))
-                            .cornerRadius(20)
+                    HStack(spacing: 8) {
+                        if transaction.isPending {
+                            statusBadge(label: "Pending", icon: "clock.fill", color: .orange)
+                        } else {
+                            statusBadge(label: "Posted", icon: "checkmark.circle.fill", color: .green)
+                        }
+                        if transaction.isTransfer {
+                            statusBadge(label: "Transfer", icon: "arrow.left.arrow.right", color: .blue)
+                        }
+                        if transaction.isSplit {
+                            statusBadge(label: "Split", icon: "scissors", color: .purple)
+                        }
+                        if transaction.reviewStatus == .reviewed {
+                            statusBadge(label: "Reviewed", icon: "checkmark.seal.fill", color: .teal)
+                        }
                     }
                 }
                 .padding(.top)
@@ -54,6 +62,10 @@ struct TransactionDetailView: View {
                     detailRow(label: "Category", value: transaction.category.displayName)
                     Divider().padding(.leading)
                     detailRow(label: "Date", value: transaction.date.formatted_mdy)
+                    if let raw = transaction.rawDescription, !raw.isEmpty, raw != transaction.name {
+                        Divider().padding(.leading)
+                        detailRow(label: "Original", value: raw)
+                    }
                     if let notes = transaction.notes, !notes.isEmpty {
                         Divider().padding(.leading)
                         detailRow(label: "Notes", value: notes)
@@ -67,7 +79,71 @@ struct TransactionDetailView: View {
                 .cornerRadius(16)
                 .padding(.horizontal)
 
-                // Actions
+                // Smart Actions Card
+                VStack(spacing: 0) {
+                    // Hide from budgets toggle
+                    HStack {
+                        Label("Hide from Budgets", systemImage: "eye.slash")
+                            .font(.subheadline)
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { transaction.isHidden },
+                            set: { newValue in
+                                var updated = transaction
+                                updated.isHidden = newValue
+                                transaction = updated
+                                vm.updateTransaction(updated)
+                            }
+                        ))
+                        .labelsHidden()
+                    }
+                    .padding()
+
+                    if !transaction.isManual && transaction.reviewStatus != .reviewed {
+                        Divider().padding(.leading)
+                        Button {
+                            var updated = transaction
+                            updated.reviewStatus = .reviewed
+                            updated.reviewedAt = Date()
+                            transaction = updated
+                            vm.updateTransaction(updated)
+                        } label: {
+                            HStack {
+                                Label("Mark as Reviewed", systemImage: "checkmark.seal")
+                                    .font(.subheadline)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding()
+                            .foregroundColor(.primary)
+                        }
+                    }
+
+                    if !transaction.isSplit && transaction.isManual {
+                        Divider().padding(.leading)
+                        Button {
+                            showSplitSheet = true
+                        } label: {
+                            HStack {
+                                Label("Split Transaction", systemImage: "scissors")
+                                    .font(.subheadline)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding()
+                            .foregroundColor(.primary)
+                        }
+                    }
+                }
+                .background(Color(.secondarySystemBackground))
+                .cornerRadius(16)
+                .padding(.horizontal)
+
+                // Manual-only actions
                 if transaction.isManual {
                     VStack(spacing: 12) {
                         Button {
@@ -103,6 +179,16 @@ struct TransactionDetailView: View {
         .sheet(isPresented: $isEditing) {
             editSheet
         }
+        .sheet(isPresented: $showSplitSheet) {
+            SplitTransactionView(transaction: transaction) { splits in
+                // Mark original as split and save each split
+                var updated = transaction
+                updated.isSplit = true
+                transaction = updated
+                vm.updateTransaction(updated)
+                splits.forEach { vm.addTransaction($0) }
+            }
+        }
         .alert("Delete Transaction?", isPresented: $showDeleteAlert) {
             Button("Delete", role: .destructive) {
                 vm.deleteTransaction(transaction)
@@ -112,6 +198,17 @@ struct TransactionDetailView: View {
         } message: {
             Text("This action cannot be undone.")
         }
+    }
+
+    // MARK: - Status Badge
+    private func statusBadge(label: String, icon: String, color: Color) -> some View {
+        Label(label, systemImage: icon)
+            .font(.caption)
+            .foregroundColor(color)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .background(color.opacity(0.15))
+            .cornerRadius(20)
     }
 
     // MARK: - Detail Row
@@ -183,5 +280,106 @@ struct TransactionDetailView: View {
         transaction = updated
         vm.updateTransaction(updated)
         isEditing = false
+    }
+}
+
+// MARK: - Split Transaction View
+struct SplitTransactionView: View {
+    @Environment(\.dismiss) private var dismiss
+    let transaction: Transaction
+    let onSave: ([Transaction]) -> Void
+
+    @State private var amount1Text: String
+    @State private var amount2Text: String
+    @State private var category1: TransactionCategory
+    @State private var category2: TransactionCategory = .other
+    @State private var notes1 = ""
+    @State private var notes2 = ""
+
+    init(transaction: Transaction, onSave: @escaping ([Transaction]) -> Void) {
+        self.transaction = transaction
+        self.onSave = onSave
+        let half = String(format: "%.2f", transaction.absoluteAmount / 2)
+        _amount1Text = State(initialValue: half)
+        _amount2Text = State(initialValue: half)
+        _category1 = State(initialValue: transaction.category)
+    }
+
+    private var total: Double { (Double(amount1Text) ?? 0) + (Double(amount2Text) ?? 0) }
+    private var isValid: Bool { abs(total - transaction.absoluteAmount) < 0.01 }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Split 1") {
+                    HStack {
+                        Text("Amount").foregroundColor(.secondary)
+                        Spacer()
+                        TextField("0.00", text: $amount1Text).keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    Picker("Category", selection: $category1) {
+                        ForEach(TransactionCategory.allCases) { cat in
+                            Label(cat.displayName, systemImage: cat.systemImage).tag(cat)
+                        }
+                    }
+                    TextField("Notes (optional)", text: $notes1)
+                }
+
+                Section("Split 2") {
+                    HStack {
+                        Text("Amount").foregroundColor(.secondary)
+                        Spacer()
+                        TextField("0.00", text: $amount2Text).keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    Picker("Category", selection: $category2) {
+                        ForEach(TransactionCategory.allCases) { cat in
+                            Label(cat.displayName, systemImage: cat.systemImage).tag(cat)
+                        }
+                    }
+                    TextField("Notes (optional)", text: $notes2)
+                }
+
+                Section {
+                    HStack {
+                        Text("Total").foregroundColor(.secondary)
+                        Spacer()
+                        Text(total.asCurrency)
+                            .foregroundColor(isValid ? .primary : .red)
+                    }
+                    if !isValid {
+                        Text("Splits must sum to \(transaction.absoluteAmount.asCurrency)")
+                            .font(.caption).foregroundColor(.red)
+                    }
+                }
+            }
+            .navigationTitle("Split Transaction")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        guard isValid else { return }
+                        let sign: Double = transaction.isExpense ? 1 : -1
+                        var s1 = transaction; s1.id = UUID().uuidString
+                        s1.amount = (Double(amount1Text) ?? 0) * sign
+                        s1.category = category1
+                        s1.notes = notes1.isEmpty ? nil : notes1
+                        s1.isSplit = true; s1.lineageGroupId = transaction.id
+
+                        var s2 = transaction; s2.id = UUID().uuidString
+                        s2.amount = (Double(amount2Text) ?? 0) * sign
+                        s2.category = category2
+                        s2.notes = notes2.isEmpty ? nil : notes2
+                        s2.isSplit = true; s2.lineageGroupId = transaction.id
+
+                        onSave([s1, s2])
+                        dismiss()
+                    }
+                    .disabled(!isValid)
+                }
+            }
+        }
     }
 }

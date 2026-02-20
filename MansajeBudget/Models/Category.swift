@@ -1,5 +1,73 @@
 import SwiftUI
 
+// MARK: - Dynamic Firestore-backed category (user-editable, hierarchical)
+enum CategoryType: String, Codable {
+    case income
+    case expense
+    case transfer
+}
+
+struct UserCategory: Identifiable, Codable {
+    let id: String
+    var userId: String
+    var name: String
+    var parentId: String?
+    var type: CategoryType
+    var isSystem: Bool
+    var isHidden: Bool
+    var icon: String
+    var color: String     // hex string
+
+    init(
+        id: String = UUID().uuidString,
+        userId: String,
+        name: String,
+        parentId: String? = nil,
+        type: CategoryType,
+        isSystem: Bool = false,
+        isHidden: Bool = false,
+        icon: String = "tag.fill",
+        color: String = "#868E96"
+    ) {
+        self.id = id; self.userId = userId; self.name = name
+        self.parentId = parentId; self.type = type; self.isSystem = isSystem
+        self.isHidden = isHidden; self.icon = icon; self.color = color
+    }
+}
+
+extension UserCategory {
+    var swiftUIColor: Color { Color(hex: color) }
+
+    var firestoreData: [String: Any] {
+        var data: [String: Any] = [
+            "id": id, "user_id": userId, "name": name,
+            "type": type.rawValue, "is_system": isSystem,
+            "is_hidden": isHidden, "icon": icon, "color": color
+        ]
+        if let p = parentId { data["parent_id"] = p }
+        return data
+    }
+
+    static func from(_ data: [String: Any], id: String) -> UserCategory? {
+        guard
+            let userId = data["user_id"] as? String,
+            let name = data["name"] as? String,
+            let typeRaw = data["type"] as? String,
+            let type = CategoryType(rawValue: typeRaw)
+        else { return nil }
+        return UserCategory(
+            id: id, userId: userId, name: name,
+            parentId: data["parent_id"] as? String,
+            type: type,
+            isSystem: data["is_system"] as? Bool ?? false,
+            isHidden: data["is_hidden"] as? Bool ?? false,
+            icon: data["icon"] as? String ?? "tag.fill",
+            color: data["color"] as? String ?? "#868E96"
+        )
+    }
+}
+
+// MARK: - Static category enum (legacy — kept for Plaid mapping + existing Firestore data)
 enum TransactionCategory: String, Codable, CaseIterable, Identifiable {
     case food
     case groceries
