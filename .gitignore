@@ -1,0 +1,44 @@
+# Executables
+*.exe
+*.zip
+*.7z
+
+# Node.js
+node_modules/
+npm-debug.log*
+.npm
+
+# Environment secrets
+.env
+MansajeBudgetBackend/firebase-service-account.json
+
+# iOS / Xcode
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+Pods/
+.build/
+xcuserdata/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.moved-aside
+*.hmap
+*.ipa
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# TravelCompass (separate project)
+TravelCompass/
+
+# Claude
+.claude/
