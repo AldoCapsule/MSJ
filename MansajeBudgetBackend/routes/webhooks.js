@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const { PlaidApi, PlaidEnvironments, Configuration } = require('plaid');
+const { verifyPlaidWebhook } = require('../middleware/plaidWebhookVerification');
 
 const plaidConfig = new Configuration({
   basePath: PlaidEnvironments[process.env.PLAID_ENV || 'sandbox'],
@@ -18,9 +19,9 @@ const db = () => admin.firestore();
 // ─────────────────────────────────────────────────────────────
 // POST /webhooks/plaid
 // Plaid sends these directly — no Firebase auth here.
-// Verify webhook authenticity via Plaid-Verification header in production.
+// Signature is verified via ES256 JWT in the Plaid-Verification header.
 // ─────────────────────────────────────────────────────────────
-router.post('/plaid', async (req, res) => {
+router.post('/plaid', verifyPlaidWebhook(plaidClient), async (req, res) => {
   const { webhook_type, webhook_code, item_id, error } = req.body;
 
   console.log(`[WEBHOOK] type=${webhook_type} code=${webhook_code} item=${item_id}`);
