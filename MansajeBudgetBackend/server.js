@@ -1,19 +1,11 @@
 require('dotenv').config();
+
+// Validate required env vars at startup — fail fast
+require('./db');
+
 const express = require('express');
 const cors = require('cors');
-const admin = require('firebase-admin');
 const { generalLimiter } = require('./middleware/rateLimiter');
-
-// Initialize Firebase Admin
-const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
-  ? require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH)
-  : undefined;
-
-admin.initializeApp(
-  serviceAccount
-    ? { credential: admin.credential.cert(serviceAccount) }
-    : { credential: admin.credential.applicationDefault() }
-);
 
 const app = express();
 
@@ -54,8 +46,8 @@ app.use('/webhooks', webhookRoutes);
 const { authLimiter } = require('./middleware/rateLimiter');
 
 // Auth endpoints have stricter rate limiting
-// (Firebase Auth handles actual auth; these are helper/session endpoints)
-app.use('/v1/auth', authLimiter, require('./routes/v1/categories')); // placeholder — auth is Firebase-side
+// (Supabase Auth handles actual auth; these are helper/session endpoints)
+app.use('/v1/auth', authLimiter, require('./routes/v1/categories')); // placeholder — auth is Supabase-side
 
 app.use('/v1/categories',    require('./routes/v1/categories'));
 app.use('/v1/transactions',  require('./routes/v1/transactions'));
@@ -75,6 +67,8 @@ app.use('/v1/recurring',     require('./routes/v1/recurring'));
 app.use('/v1/insights',      require('./routes/v1/insights'));
 app.use('/v1/investments',   require('./routes/v1/investments'));
 app.use('/v1/rules',         require('./routes/v1/rules'));
+app.use('/v1/wealth',        require('./routes/v1/wealth'));
+app.use('/v1/goals/:goalId', require('./routes/v1/wealth')); // milestone sub-routes
 
 // ── Health check ────────────────────────────────────────────────
 app.get('/health', (req, res) => {
