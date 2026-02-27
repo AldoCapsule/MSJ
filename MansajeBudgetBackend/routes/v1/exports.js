@@ -1,10 +1,12 @@
+'use strict';
 const express = require('express');
 const router = express.Router();
-const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
 const { verifyFirebaseToken } = require('../../middleware/auth');
+const { supabaseForUser } = require('../../db');
 const { heavyLimiter } = require('../../middleware/rateLimiter');
 
-const db = () => admin.firestore();
+const MAX_ROWS = 10000;
 
 router.use(verifyFirebaseToken);
 router.use(heavyLimiter);
@@ -27,60 +29,71 @@ router.post('/', async (req, res, next) => {
     return res.status(400).json({ error: 'format must be csv or json' });
   }
   try {
-    const jobRef = db().collection('users').doc(req.uid).collection('export_jobs').doc();
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
-    await jobRef.set({
-      id: jobRef.id,
+    const jobId = uuidv4();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    await supabaseForUser(req.accessToken).from('export_jobs').insert({
+      id: jobId,
       user_id: req.uid,
       type,
       format,
-      from: from || null,
-      to: to || null,
+      from_date: from || null,
+      to_date: to || null,
       status: 'processing',
-      created_at: admin.firestore.FieldValue.serverTimestamp(),
       expires_at: expiresAt,
     });
 
-    // Build export data
-    let data;
-    const fromDate = from ? new Date(from) : new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
-    const toDate = to ? new Date(to) : new Date();
+    const fromDate = from || new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const toDate = to || new Date().toISOString().slice(0, 10);
 
+    let outputData;
     if (type === 'transactions') {
-      const snap = await db().collection('users').doc(req.uid).collection('transactions')
-        .where('date', '>=', fromDate).where('date', '<=', toDate)
-        .orderBy('date', 'desc').get();
-      const rows = snap.docs.map(d => {
-        const t = d.data();
-        const d2 = t.date?.toDate?.() || new Date(t.date);
-        return { id: d.id, date: d2.toISOString().slice(0, 10), name: t.name,
-          amount: t.amount, category: t.category || t.categoryId, account: t.accountId,
-          notes: t.notes || '', is_pending: t.isPending, is_manual: t.isManual };
-      });
-      data = format === 'json' ? JSON.stringify({ transactions: rows }, null, 2)
-        : formatCSV(rows, ['id', 'date', 'name', 'amount', 'category', 'account', 'notes', 'is_pending', 'is_manual']);
+      const { data: rows, error } = await supabaseForUser(req.accessToken)
+        .from('transactions')
+        .select('id, date, name, amount, category, category_id, account_id, notes, is_pending, is_manual')
+        .gte('date', fromDate)
+        .lte('date', toDate)
+        .order('date', { ascending: false })
+        .limit(MAX_ROWS);
+      if (error) return res.status(500).json({ error: 'Database error' });
+
+      const formatted = (rows || []).map(t => ({
+        id: t.id, date: t.date, name: t.name, amount: t.amount,
+        category: t.category || t.category_id, account: t.account_id,
+        notes: t.notes || '', is_pending: t.is_pending, is_manual: t.is_manual,
+      }));
+      outputData = format === 'json'
+        ? JSON.stringify({ transactions: formatted }, null, 2)
+        : formatCSV(formatted, ['id', 'date', 'name', 'amount', 'category', 'account', 'notes', 'is_pending', 'is_manual']);
     } else if (type === 'balances') {
-      const snap = await db().collection('users').doc(req.uid).collection('accounts').get();
-      const rows = snap.docs.map(d => {
-        const a = d.data();
-        return { id: d.id, name: a.name, type: a.type, balance: a.balance || a.balance_current,
-          institution: a.institutionName, mask: a.mask || '' };
-      });
-      data = format === 'json' ? JSON.stringify({ accounts: rows }, null, 2)
-        : formatCSV(rows, ['id', 'name', 'type', 'balance', 'institution', 'mask']);
+      const { data: rows, error } = await supabaseForUser(req.accessToken)
+        .from('accounts')
+        .select('id, name, type, current_balance, institution_name, mask')
+        .limit(MAX_ROWS);
+      if (error) return res.status(500).json({ error: 'Database error' });
+
+      const formatted = (rows || []).map(a => ({
+        id: a.id, name: a.name, type: a.type, balance: a.current_balance,
+        institution: a.institution_name, mask: a.mask || '',
+      }));
+      outputData = format === 'json'
+        ? JSON.stringify({ accounts: formatted }, null, 2)
+        : formatCSV(formatted, ['id', 'name', 'type', 'balance', 'institution', 'mask']);
     } else {
-      data = JSON.stringify({ note: 'Full export not yet implemented for type: ' + type });
+      outputData = JSON.stringify({ note: 'Full export not yet implemented for type: ' + type });
     }
 
-    await jobRef.update({ status: 'completed',
-      completed_at: admin.firestore.FieldValue.serverTimestamp(),
-      row_count: data.split('\n').length });
+    const rowCount = (outputData.match(/\n/g) || []).length;
+    await supabaseForUser(req.accessToken).from('export_jobs').update({
+      status: 'completed',
+      completed_at: new Date().toISOString(),
+      row_count: rowCount,
+    }).eq('id', jobId);
 
-    // Return inline (small datasets); large datasets would use signed URL to Cloud Storage
     const contentType = format === 'json' ? 'application/json' : 'text/csv';
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="mansajebudget-${type}-${Date.now()}.${format}"`);
-    res.send(data);
+    res.setHeader('Content-Disposition',
+      `attachment; filename="mansajebudget-${type}-${Date.now()}.${format}"`);
+    res.send(outputData);
   } catch (err) {
     console.error('[EXPORTS] error:', err.message);
     next({ status: 500, message: 'Failed to generate export' });
@@ -90,10 +103,14 @@ router.post('/', async (req, res, next) => {
 // GET /v1/exports/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const snap = await db().collection('users').doc(req.uid)
-      .collection('export_jobs').doc(req.params.id).get();
-    if (!snap.exists) return res.status(404).json({ error: 'Export job not found' });
-    res.json({ export: { id: snap.id, ...snap.data() } });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('export_jobs')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+    if (error?.code === 'PGRST116') return res.status(404).json({ error: 'Export job not found' });
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ export: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to fetch export job' });
   }
@@ -102,15 +119,19 @@ router.get('/:id', async (req, res, next) => {
 // POST /v1/privacy/delete
 router.post('/privacy/delete', async (req, res, next) => {
   try {
-    const ref = db().collection('users').doc(req.uid).collection('deletion_requests').doc();
-    await ref.set({
-      id: ref.id,
-      user_id: req.uid,
-      requested_at: admin.firestore.FieldValue.serverTimestamp(),
-      status: 'pending',
-      completed_at: null,
-    });
-    res.json({ request_id: ref.id, status: 'pending',
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('deletion_requests')
+      .insert({
+        id: uuidv4(),
+        user_id: req.uid,
+        requested_at: new Date().toISOString(),
+        status: 'pending',
+        completed_at: null,
+      })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ request_id: data.id, status: 'pending',
       message: 'Deletion request received. Your data will be permanently deleted within 30 days.' });
   } catch (err) {
     next({ status: 500, message: 'Failed to submit deletion request' });
@@ -120,10 +141,14 @@ router.post('/privacy/delete', async (req, res, next) => {
 // GET /v1/privacy/delete/:id/status
 router.get('/privacy/delete/:id/status', async (req, res, next) => {
   try {
-    const snap = await db().collection('users').doc(req.uid)
-      .collection('deletion_requests').doc(req.params.id).get();
-    if (!snap.exists) return res.status(404).json({ error: 'Deletion request not found' });
-    res.json({ request: { id: snap.id, ...snap.data() } });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('deletion_requests')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+    if (error?.code === 'PGRST116') return res.status(404).json({ error: 'Deletion request not found' });
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ request: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to fetch deletion request' });
   }
