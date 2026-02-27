@@ -32,7 +32,14 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, _res, buf) => {
+    // Capture raw body buffer for Plaid webhook signature verification.
+    // Used by middleware/plaidWebhookVerification.js — do not remove.
+    req.rawBody = buf;
+  },
+}));
 
 // General rate limiter on all routes
 app.use(generalLimiter);
