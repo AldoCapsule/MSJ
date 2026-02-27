@@ -1,9 +1,9 @@
+'use strict';
 const express = require('express');
 const router = express.Router();
-const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
 const { verifyFirebaseToken } = require('../../middleware/auth');
-
-const db = () => admin.firestore();
+const { supabaseForUser, supabaseAdmin } = require('../../db');
 
 router.use(verifyFirebaseToken);
 
@@ -15,18 +15,20 @@ router.post('/rules', async (req, res, next) => {
     return res.status(400).json({ error: `type must be one of: ${validTypes.join(', ')}` });
   }
   try {
-    const ref = db().collection('users').doc(req.uid).collection('alert_rules').doc();
-    const rule = {
-      id: ref.id,
-      user_id: req.uid,
-      type,
-      params: params || {},
-      channel: channel || 'push',
-      enabled: enabled !== false,
-      created_at: admin.firestore.FieldValue.serverTimestamp(),
-    };
-    await ref.set(rule);
-    res.status(201).json({ rule });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('alert_rules')
+      .insert({
+        id: uuidv4(),
+        user_id: req.uid,
+        type,
+        params: params || {},
+        channel: channel || 'push',
+        enabled: enabled !== false,
+      })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.status(201).json({ rule: data });
   } catch (err) {
     console.error('[ALERTS] POST rules error:', err.message);
     next({ status: 500, message: 'Failed to create alert rule' });
@@ -36,9 +38,12 @@ router.post('/rules', async (req, res, next) => {
 // GET /v1/alerts/rules
 router.get('/rules', async (req, res, next) => {
   try {
-    const snap = await db().collection('users').doc(req.uid).collection('alert_rules')
-      .orderBy('created_at', 'desc').get();
-    res.json({ rules: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('alert_rules')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ rules: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to fetch alert rules' });
   }
@@ -47,16 +52,19 @@ router.get('/rules', async (req, res, next) => {
 // PATCH /v1/alerts/rules/:id
 router.patch('/rules/:id', async (req, res, next) => {
   try {
-    const ref = db().collection('users').doc(req.uid).collection('alert_rules').doc(req.params.id);
-    const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ error: 'Alert rule not found' });
-
-    const updates = { updated_at: admin.firestore.FieldValue.serverTimestamp() };
+    const updates = { updated_at: new Date().toISOString() };
     ['type', 'params', 'channel', 'enabled'].forEach(k => {
       if (req.body[k] !== undefined) updates[k] = req.body[k];
     });
-    await ref.update(updates);
-    res.json({ rule: { id: snap.id, ...snap.data(), ...updates } });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('alert_rules')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error?.code === 'PGRST116') return res.status(404).json({ error: 'Alert rule not found' });
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ rule: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to update alert rule' });
   }
@@ -66,13 +74,17 @@ router.patch('/rules/:id', async (req, res, next) => {
 router.get('/events', async (req, res, next) => {
   try {
     const { unacknowledged_only } = req.query;
-    let query = db().collection('users').doc(req.uid).collection('alert_events')
-      .orderBy('fired_at', 'desc').limit(100);
+    let query = supabaseForUser(req.accessToken)
+      .from('alert_events')
+      .select('*')
+      .order('fired_at', { ascending: false })
+      .limit(100);
     if (unacknowledged_only === 'true') {
-      query = query.where('acknowledged_at', '==', null);
+      query = query.is('acknowledged_at', null);
     }
-    const snap = await query.get();
-    res.json({ events: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ events: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to fetch alert events' });
   }
@@ -81,49 +93,63 @@ router.get('/events', async (req, res, next) => {
 // POST /v1/alerts/events/:id/acknowledge
 router.post('/events/:id/acknowledge', async (req, res, next) => {
   try {
-    const ref = db().collection('users').doc(req.uid).collection('alert_events').doc(req.params.id);
-    const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ error: 'Alert event not found' });
-    await ref.update({ acknowledged_at: admin.firestore.FieldValue.serverTimestamp() });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('alert_events')
+      .update({ acknowledged_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error?.code === 'PGRST116') return res.status(404).json({ error: 'Alert event not found' });
+    if (error) return res.status(500).json({ error: 'Database error' });
     res.json({ success: true });
   } catch (err) {
     next({ status: 500, message: 'Failed to acknowledge alert' });
   }
 });
 
-// Internal helper — evaluate and fire budget threshold alerts
-// Called by webhook/transaction-sync handlers when budgets update
+// Internal helper — evaluate and fire budget threshold alerts (called by webhook handlers)
 async function evaluateBudgetAlerts(uid) {
   try {
-    const rulesSnap = await db().collection('users').doc(uid).collection('alert_rules')
-      .where('type', '==', 'budget_threshold').where('enabled', '==', true).get();
-    if (rulesSnap.empty) return;
+    const { data: rules } = await supabaseAdmin
+      .from('alert_rules')
+      .select('*')
+      .eq('user_id', uid)
+      .eq('type', 'budget_threshold')
+      .eq('enabled', true);
+    if (!rules?.length) return;
 
     const now = new Date();
-    const month = now.getMonth() + 1;
-    const year = now.getFullYear();
+    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const monthStart = `${month}-01`;
+    const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString().slice(0, 10);
 
-    const budgetsSnap = await db().collection('users').doc(uid).collection('budgets')
-      .where('month', '==', month).where('year', '==', year).get();
+    const { data: budgets } = await supabaseAdmin
+      .from('budgets')
+      .select('*, budget_lines(*)')
+      .eq('user_id', uid)
+      .gte('period_start', monthStart)
+      .lt('period_start', monthEnd);
 
-    for (const ruleDoc of rulesSnap.docs) {
-      const rule = ruleDoc.data();
+    for (const rule of rules) {
       const thresholdPct = rule.params?.threshold_pct || 80;
       const categoryId = rule.params?.category_id;
 
-      for (const budgetDoc of budgetsSnap.docs) {
-        const budget = budgetDoc.data();
-        if (categoryId && budget.category !== categoryId && budget.categoryId !== categoryId) continue;
-        const progress = budget.limit > 0 ? (budget.spent / budget.limit) * 100 : 0;
-        if (progress >= thresholdPct) {
-          const eventRef = db().collection('users').doc(uid).collection('alert_events').doc();
-          await eventRef.set({
-            id: eventRef.id,
-            alert_rule_id: ruleDoc.id,
-            fired_at: admin.firestore.FieldValue.serverTimestamp(),
-            payload: { category: budget.category, spent: budget.spent, limit: budget.limit, progress_pct: progress },
-            acknowledged_at: null,
-          });
+      for (const budget of (budgets || [])) {
+        for (const line of (budget.budget_lines || [])) {
+          if (categoryId && line.category_id !== categoryId) continue;
+          const progress = line.amount_planned > 0
+            ? (line.amount_actual_cached / line.amount_planned) * 100 : 0;
+          if (progress >= thresholdPct) {
+            await supabaseAdmin.from('alert_events').insert({
+              id: uuidv4(),
+              user_id: uid,
+              alert_rule_id: rule.id,
+              fired_at: new Date().toISOString(),
+              payload: { category_id: line.category_id, spent: line.amount_actual_cached,
+                limit: line.amount_planned, progress_pct: progress },
+              acknowledged_at: null,
+            });
+          }
         }
       }
     }
