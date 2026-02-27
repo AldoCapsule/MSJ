@@ -14,7 +14,10 @@ create policy "users own their row" on users for all
 
 -- Auto-create user row on signup
 create or replace function handle_new_user()
-returns trigger language plpgsql security definer as $$
+returns trigger language plpgsql
+security definer
+set search_path = public
+as $$
 begin
   insert into users (id, display_name)
   values (new.id, new.raw_user_meta_data->>'full_name');
@@ -279,3 +282,16 @@ create table retirement_projections (
 alter table retirement_projections enable row level security;
 create policy "users own their projection" on retirement_projections for all
   using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- ── Additional indexes for RLS-filtered queries ───────────────────
+create index on goals(user_id);
+create index on categories(user_id);
+create index on goal_milestones(user_id);
+create index on goal_milestones(goal_id);
+create index on investments(user_id);
+create index on investments(account_id);
+create index on recurring_streams(user_id);
+create index on rules(user_id);
+create index on alerts(user_id);
+create index on alert_events(user_id);
+create index on alert_events(alert_id);
