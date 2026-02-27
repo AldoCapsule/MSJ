@@ -1,41 +1,46 @@
+'use strict';
 const express = require('express');
 const router = express.Router();
-const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
 const { verifyFirebaseToken } = require('../../middleware/auth');
-
-const db = () => admin.firestore();
+const { supabaseForUser } = require('../../db');
 
 router.use(verifyFirebaseToken);
 
 // GET /v1/dashboard
 router.get('/dashboard', async (req, res, next) => {
   try {
-    const uid = req.uid;
     const now = new Date();
-    const month = now.getMonth() + 1;
-    const year = now.getFullYear();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
+    const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString().slice(0, 10);
 
-    const [accountsSnap, recentTxnsSnap, budgetsSnap] = await Promise.all([
-      db().collection('users').doc(uid).collection('accounts').get(),
-      db().collection('users').doc(uid).collection('transactions')
-        .orderBy('date', 'desc').limit(10).get(),
-      db().collection('users').doc(uid).collection('budgets')
-        .where('month', '==', month).where('year', '==', year).get(),
+    const [
+      { data: accounts },
+      { data: recentTxns },
+      { data: budgets },
+    ] = await Promise.all([
+      supabaseForUser(req.accessToken).from('accounts').select('*'),
+      supabaseForUser(req.accessToken).from('transactions').select('*')
+        .order('date', { ascending: false }).limit(10),
+      supabaseForUser(req.accessToken).from('budgets').select('*, budget_lines(*)')
+        .gte('period_start', monthStart).lt('period_start', monthEnd),
     ]);
 
-    const accounts = accountsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-    const transactions = recentTxnsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-    const budgets = budgetsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const accs = accounts || [];
+    const txns = recentTxns || [];
+    const bdgs = budgets || [];
 
-    const assets = accounts.filter(a => !['credit', 'loan'].includes(a.type))
-      .reduce((s, a) => s + (a.balance || a.balance_current || 0), 0);
-    const liabilities = accounts.filter(a => ['credit', 'loan'].includes(a.type))
-      .reduce((s, a) => s + (a.balance || a.balance_current || 0), 0);
+    const assets = accs.filter(a => !['credit', 'loan'].includes(a.type))
+      .reduce((s, a) => s + (Number(a.current_balance) || 0), 0);
+    const liabilities = accs.filter(a => ['credit', 'loan'].includes(a.type))
+      .reduce((s, a) => s + (Number(a.current_balance) || 0), 0);
 
-    const startOfMonth = new Date(year, month - 1, 1);
-    const monthlyTxns = transactions.filter(t => t.date?.toDate?.() >= startOfMonth || new Date(t.date) >= startOfMonth);
-    const monthlySpending = monthlyTxns.filter(t => (t.amount || 0) > 0 && !t.isTransfer)
+    const monthlyTxns = txns.filter(t => t.date >= monthStart);
+    const monthlySpending = monthlyTxns
+      .filter(t => (t.amount || 0) > 0 && !t.is_transfer && !t.is_hidden)
       .reduce((s, t) => s + t.amount, 0);
+
+    const allLines = bdgs.flatMap(b => b.budget_lines || []);
 
     res.json({
       net_worth: assets - liabilities,
@@ -43,11 +48,11 @@ router.get('/dashboard', async (req, res, next) => {
       liabilities_total: liabilities,
       monthly_spending: monthlySpending,
       budget_summary: {
-        total_planned: budgets.reduce((s, b) => s + (b.limit || b.amount_planned || 0), 0),
-        total_spent: budgets.reduce((s, b) => s + (b.spent || 0), 0),
+        total_planned: allLines.reduce((s, l) => s + (l.amount_planned || 0), 0),
+        total_spent: allLines.reduce((s, l) => s + (l.amount_actual_cached || 0), 0),
       },
-      recent_transactions: transactions.slice(0, 5),
-      accounts: accounts.slice(0, 10),
+      recent_transactions: txns.slice(0, 5),
+      accounts: accs.slice(0, 10),
     });
   } catch (err) {
     console.error('[REPORTS] dashboard error:', err.message);
@@ -55,23 +60,26 @@ router.get('/dashboard', async (req, res, next) => {
   }
 });
 
-// GET /v1/reports/spending?group_by=category&granularity=month
+// GET /v1/reports/spending?group_by=category&granularity=month&from=&to=
 router.get('/spending', async (req, res, next) => {
   try {
     const { group_by = 'category', granularity = 'month', from, to } = req.query;
-    const fromDate = from ? new Date(from) : new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
-    const toDate = to ? new Date(to) : new Date();
+    const fromDate = from || new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const toDate = to || new Date().toISOString().slice(0, 10);
 
-    const snap = await db().collection('users').doc(req.uid).collection('transactions')
-      .where('date', '>=', fromDate).where('date', '<=', toDate)
-      .orderBy('date', 'desc').get();
-
-    const txns = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .filter(t => (t.amount || 0) > 0 && !t.isTransfer && !t.isHidden);
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('transactions')
+      .select('date, amount, category, category_id, account_id, is_transfer, is_hidden')
+      .gte('date', fromDate)
+      .lte('date', toDate)
+      .eq('is_transfer', false)
+      .eq('is_hidden', false)
+      .gt('amount', 0);
+    if (error) return res.status(500).json({ error: 'Database error' });
 
     const grouped = {};
-    for (const txn of txns) {
-      const d = txn.date?.toDate?.() || new Date(txn.date);
+    for (const txn of (data || [])) {
+      const d = new Date(txn.date);
       let key;
       if (granularity === 'month') {
         key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
@@ -80,19 +88,23 @@ router.get('/spending', async (req, res, next) => {
         weekStart.setDate(d.getDate() - d.getDay());
         key = weekStart.toISOString().slice(0, 10);
       } else {
-        key = d.toISOString().slice(0, 10);
+        key = txn.date.slice(0, 10);
       }
-
-      const subKey = group_by === 'category' ? (txn.categoryId || txn.category || 'other') : txn.accountId;
+      const subKey = group_by === 'category'
+        ? (txn.category_id || txn.category || 'other') : txn.account_id;
       if (!grouped[key]) grouped[key] = {};
       grouped[key][subKey] = (grouped[key][subKey] || 0) + txn.amount;
     }
 
-    const result = Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b)).map(([period, cats]) => ({
-      period,
-      breakdown: Object.entries(cats).map(([key, amount]) => ({ [group_by === 'category' ? 'category' : 'account']: key, amount })),
-      total: Object.values(cats).reduce((s, v) => s + v, 0),
-    }));
+    const result = Object.entries(grouped)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([period, cats]) => ({
+        period,
+        breakdown: Object.entries(cats).map(([key, amount]) => ({
+          [group_by === 'category' ? 'category' : 'account']: key, amount,
+        })),
+        total: Object.values(cats).reduce((s, v) => s + v, 0),
+      }));
 
     res.json({ spending: result });
   } catch (err) {
@@ -105,26 +117,39 @@ router.get('/spending', async (req, res, next) => {
 router.get('/cashflow', async (req, res, next) => {
   try {
     const { month } = req.query;
-    const [year, mon] = (month || `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`).split('-').map(Number);
-    const start = new Date(year, mon - 1, 1);
-    const end = new Date(year, mon, 1);
+    const targetMonth = month ||
+      `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+    const [year, mon] = targetMonth.split('-').map(Number);
+    const start = new Date(year, mon - 1, 1).toISOString().slice(0, 10);
+    const end = new Date(year, mon, 1).toISOString().slice(0, 10);
 
-    const snap = await db().collection('users').doc(req.uid).collection('transactions')
-      .where('date', '>=', start).where('date', '<', end).get();
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('transactions')
+      .select('amount, is_transfer, is_hidden')
+      .gte('date', start)
+      .lt('date', end)
+      .eq('is_transfer', false)
+      .eq('is_hidden', false);
+    if (error) return res.status(500).json({ error: 'Database error' });
 
-    const txns = snap.docs.map(d => d.data()).filter(t => !t.isTransfer && !t.isHidden);
+    const txns = data || [];
     const income = txns.filter(t => (t.amount || 0) < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
     const expenses = txns.filter(t => (t.amount || 0) > 0).reduce((s, t) => s + t.amount, 0);
 
-    // Cache the result
-    const summaryRef = db().collection('users').doc(req.uid).collection('cashflow_summaries')
-      .doc(`${year}-${String(mon).padStart(2, '0')}`);
-    await summaryRef.set({ user_id: req.uid, month: `${year}-${String(mon).padStart(2, '0')}`,
-      income_total: income, expense_total: expenses, net_total: income - expenses,
-      computed_at: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    // Upsert summary cache
+    await supabaseForUser(req.accessToken)
+      .from('cashflow_summaries')
+      .upsert({
+        user_id: req.uid,
+        month: targetMonth,
+        income_total: income,
+        expense_total: expenses,
+        net_total: income - expenses,
+        computed_at: new Date().toISOString(),
+      }, { onConflict: 'user_id,month' });
 
-    res.json({ month: `${year}-${String(mon).padStart(2, '0')}`,
-      income_total: income, expense_total: expenses, net_total: income - expenses });
+    res.json({ month: targetMonth, income_total: income, expense_total: expenses,
+      net_total: income - expenses });
   } catch (err) {
     console.error('[REPORTS] cashflow error:', err.message);
     next({ status: 500, message: 'Failed to generate cashflow report' });
@@ -135,33 +160,41 @@ router.get('/cashflow', async (req, res, next) => {
 router.get('/networth', async (req, res, next) => {
   try {
     const { from, to } = req.query;
-    const fromDate = from ? new Date(from) : new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
-    const toDate = to ? new Date(to) : new Date();
+    const fromDate = from || new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const toDate = to || new Date().toISOString().slice(0, 10);
 
-    const snap = await db().collection('users').doc(req.uid).collection('networth_snapshots')
-      .where('as_of_date', '>=', fromDate).where('as_of_date', '<=', toDate)
-      .orderBy('as_of_date').get();
+    const { data: snapshots, error } = await supabaseForUser(req.accessToken)
+      .from('net_worth_snapshots')
+      .select('*')
+      .gte('snapshot_date', fromDate)
+      .lte('snapshot_date', toDate)
+      .order('snapshot_date');
+    if (error) return res.status(500).json({ error: 'Database error' });
 
-    const snapshots = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-    // If no historical data, compute current
-    if (snapshots.length === 0) {
-      const accountsSnap = await db().collection('users').doc(req.uid).collection('accounts').get();
-      const accounts = accountsSnap.docs.map(d => d.data());
-      const assets = accounts.filter(a => !['credit', 'loan'].includes(a.type))
-        .reduce((s, a) => s + (a.balance || a.balance_current || 0), 0);
-      const debts = accounts.filter(a => ['credit', 'loan'].includes(a.type))
-        .reduce((s, a) => s + (a.balance || a.balance_current || 0), 0);
-      const nowSnapshot = { as_of_date: new Date(), assets_total: assets, debts_total: debts,
-        net_worth_total: assets - debts };
-
-      // Persist snapshot
-      const snapshotRef = db().collection('users').doc(req.uid).collection('networth_snapshots').doc();
-      await snapshotRef.set({ id: snapshotRef.id, user_id: req.uid, ...nowSnapshot });
-      return res.json({ snapshots: [nowSnapshot] });
+    if (snapshots && snapshots.length > 0) {
+      return res.json({ snapshots });
     }
 
-    res.json({ snapshots });
+    // No historical data — compute current and persist
+    const { data: accounts } = await supabaseForUser(req.accessToken)
+      .from('accounts')
+      .select('type, current_balance');
+    const accs = accounts || [];
+    const assets = accs.filter(a => !['credit', 'loan'].includes(a.type))
+      .reduce((s, a) => s + (Number(a.current_balance) || 0), 0);
+    const debts = accs.filter(a => ['credit', 'loan'].includes(a.type))
+      .reduce((s, a) => s + (Number(a.current_balance) || 0), 0);
+
+    const nowSnapshot = {
+      id: uuidv4(),
+      user_id: req.uid,
+      snapshot_date: new Date().toISOString().slice(0, 10),
+      total_assets: assets,
+      total_liabilities: debts,
+      net_worth: assets - debts,
+    };
+    await supabaseForUser(req.accessToken).from('net_worth_snapshots').insert(nowSnapshot);
+    res.json({ snapshots: [nowSnapshot] });
   } catch (err) {
     console.error('[REPORTS] networth error:', err.message);
     next({ status: 500, message: 'Failed to fetch net worth history' });
