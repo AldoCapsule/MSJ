@@ -1,13 +1,12 @@
+'use strict';
 const express = require('express');
 const router = express.Router();
-const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
 const { verifyFirebaseToken } = require('../../middleware/auth');
-
-const db = () => admin.firestore();
+const { supabaseForUser } = require('../../db');
 
 router.use(verifyFirebaseToken);
 
-// Cadence detection heuristics (days between transactions)
 function detectCadence(intervals) {
   if (!intervals.length) return 'monthly';
   const avg = intervals.reduce((s, v) => s + v, 0) / intervals.length;
@@ -20,88 +19,86 @@ function detectCadence(intervals) {
 function nextDueDate(lastDate, cadence) {
   const d = new Date(lastDate);
   switch (cadence) {
-    case 'weekly': d.setDate(d.getDate() + 7); break;
-    case 'monthly': d.setMonth(d.getMonth() + 1); break;
+    case 'weekly':    d.setDate(d.getDate() + 7); break;
+    case 'monthly':   d.setMonth(d.getMonth() + 1); break;
     case 'quarterly': d.setMonth(d.getMonth() + 3); break;
-    case 'annual': d.setFullYear(d.getFullYear() + 1); break;
+    case 'annual':    d.setFullYear(d.getFullYear() + 1); break;
   }
-  return d;
+  return d.toISOString().slice(0, 10);
 }
 
-// POST /v1/recurring/recompute — analyse transactions to detect recurring charges
+// POST /v1/recurring/recompute
 router.post('/recompute', async (req, res, next) => {
   try {
-    const oneYearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
-    const snap = await db().collection('users').doc(req.uid).collection('transactions')
-      .where('date', '>=', oneYearAgo).where('isTransfer', '==', false).get();
+    const oneYearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const { data: txns, error } = await supabaseForUser(req.accessToken)
+      .from('transactions')
+      .select('id, name, amount, date')
+      .gte('date', oneYearAgo)
+      .eq('is_transfer', false)
+      .order('date');
+    if (error) return res.status(500).json({ error: 'Database error' });
 
-    const txns = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .sort((a, b) => new Date(a.date?.toDate?.() || a.date) - new Date(b.date?.toDate?.() || b.date));
-
-    // Group by normalised merchant name
     const byMerchant = {};
-    for (const txn of txns) {
+    for (const txn of (txns || [])) {
       const key = (txn.name || '').toLowerCase().trim().replace(/\s+#?\d+$/, '');
       if (!byMerchant[key]) byMerchant[key] = [];
       byMerchant[key].push(txn);
     }
 
     const detected = [];
-    for (const [merchantKey, merchantTxns] of Object.entries(byMerchant)) {
+    for (const [, merchantTxns] of Object.entries(byMerchant)) {
       if (merchantTxns.length < 2) continue;
-
-      const dates = merchantTxns.map(t => new Date(t.date?.toDate?.() || t.date));
+      const dates = merchantTxns.map(t => new Date(t.date));
       const intervals = [];
       for (let i = 1; i < dates.length; i++) {
         intervals.push((dates[i] - dates[i - 1]) / (1000 * 60 * 60 * 24));
       }
-
-      // Only flag as recurring if intervals are consistent (variance < 50%)
       const avg = intervals.reduce((s, v) => s + v, 0) / intervals.length;
       const variance = intervals.reduce((s, v) => s + Math.abs(v - avg), 0) / intervals.length;
       if (variance > avg * 0.5) continue;
 
       const cadence = detectCadence(intervals);
       const lastTxn = merchantTxns[merchantTxns.length - 1];
-      const lastDate = lastTxn.date?.toDate?.() || new Date(lastTxn.date);
       const amounts = merchantTxns.map(t => t.amount);
       const lastAmount = amounts[amounts.length - 1];
       const priceChanged = amounts.some(a => Math.abs(a - lastAmount) > 0.01);
-
       const priceHistory = merchantTxns.map(t => ({
-        date: (t.date?.toDate?.() || new Date(t.date)).toISOString().slice(0, 10),
+        date: new Date(t.date).toISOString().slice(0, 10),
         amount: t.amount,
       }));
 
-      detected.push({ merchantName: lastTxn.name, cadence, lastAmount, priceChangeFlag: priceChanged,
-        nextDueDate: nextDueDate(lastDate, cadence), priceHistory });
-    }
-
-    // Write detected entities to Firestore
-    const batch = db().batch();
-    const col = db().collection('users').doc(req.uid).collection('recurring_entities');
-
-    // Clear old detected entries
-    const oldSnap = await col.where('is_user_created', '==', false).get();
-    oldSnap.docs.forEach(d => batch.delete(d.ref));
-
-    for (const entity of detected) {
-      const ref = col.doc();
-      batch.set(ref, {
-        id: ref.id,
-        user_id: req.uid,
-        merchant_name: entity.merchantName,
-        cadence: entity.cadence,
-        next_due_date: entity.nextDueDate,
-        last_amount: entity.lastAmount,
-        is_subscription: true,
-        price_change_flag: entity.priceChangeFlag,
-        price_history: entity.priceHistory,
-        is_user_created: false,
-        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      detected.push({
+        merchant_name: lastTxn.name,
+        cadence,
+        last_amount: lastAmount,
+        price_change_flag: priceChanged,
+        next_due_date: nextDueDate(lastTxn.date, cadence),
+        price_history: priceHistory,
       });
     }
-    if (detected.length > 0 || oldSnap.size > 0) await batch.commit();
+
+    // Clear old auto-detected entries
+    await supabaseForUser(req.accessToken)
+      .from('recurring_streams')
+      .delete()
+      .eq('is_user_created', false);
+
+    if (detected.length > 0) {
+      const rows = detected.map(e => ({
+        id: uuidv4(),
+        user_id: req.uid,
+        merchant_name: e.merchant_name,
+        cadence: e.cadence,
+        next_due_date: e.next_due_date,
+        last_amount: e.last_amount,
+        is_subscription: true,
+        price_change_flag: e.price_change_flag,
+        price_history: e.price_history,
+        is_user_created: false,
+      }));
+      await supabaseForUser(req.accessToken).from('recurring_streams').insert(rows);
+    }
 
     res.json({ detected_count: detected.length, recurring: detected });
   } catch (err) {
@@ -113,9 +110,12 @@ router.post('/recompute', async (req, res, next) => {
 // GET /v1/recurring
 router.get('/', async (req, res, next) => {
   try {
-    const snap = await db().collection('users').doc(req.uid).collection('recurring_entities')
-      .orderBy('next_due_date').get();
-    res.json({ recurring: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('recurring_streams')
+      .select('*')
+      .order('next_due_date');
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ recurring: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to fetch recurring' });
   }
@@ -125,13 +125,17 @@ router.get('/', async (req, res, next) => {
 router.get('/upcoming', async (req, res, next) => {
   try {
     const days = parseInt(req.query.days) || 30;
-    const now = new Date();
-    const until = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    const now = new Date().toISOString().slice(0, 10);
+    const until = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-    const snap = await db().collection('users').doc(req.uid).collection('recurring_entities')
-      .where('next_due_date', '>=', now).where('next_due_date', '<=', until)
-      .orderBy('next_due_date').get();
-    res.json({ upcoming: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('recurring_streams')
+      .select('*')
+      .gte('next_due_date', now)
+      .lte('next_due_date', until)
+      .order('next_due_date');
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ upcoming: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to fetch upcoming recurring' });
   }
