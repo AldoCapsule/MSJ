@@ -1,0 +1,378 @@
+rules_version = '2';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MansajeBudget — Production Firestore Security Rules
+//
+// Design principles:
+//  1. Default deny  — every path not explicitly listed is denied automatically.
+//  2. Owner-only    — authenticated users can only touch their own uid subtree.
+//  3. Schema guards — CREATE operations validate required fields and types.
+//  4. Write-lock    — server-only collections (plaid_tokens, connections, jobs)
+//                     have no client write rule → denied from client SDK.
+//  5. Field-lock    — alert_events: clients may only set acknowledged_at.
+//  6. Size cap      — documents may not exceed 50 top-level fields.
+//  7. Rate limit    — advisory check against a server-maintained counter.
+//                     ⚠ This is NOT atomic. Concurrent writes can exceed the
+//                     limit. Enforce at the transport layer with Express
+//                     generalLimiter and Firebase App Check for true protection.
+//
+// Deployment:
+//   firebase deploy --only firestore:rules
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // HELPER FUNCTIONS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Is the request from a signed-in user who owns this uid path?
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    // Document must not exceed 50 top-level fields.
+    // Protects against runaway data growth and unbounded reads.
+    function notOversized() {
+      return request.resource.data.keys().size() <= 50;
+    }
+
+    // ── Schema validators ────────────────────────────────────────────────────
+    //
+    // Applied on CREATE only. UPDATE uses relaxed validation because the app
+    // uses setData(..., merge: true) which sends only changed fields — requiring
+    // the full schema on every update would reject all partial updates.
+
+    // Validates a transaction document on create.
+    // NOTE: The codebase uses the field name 'name' for the transaction
+    // description (e.g. "Starbucks"). The spec requested 'description' but
+    // changing the field name here would reject all writes from the current iOS
+    // app. Align the app's field name before changing this validator.
+    function validTransaction(data) {
+      return data.keys().hasAll(['amount', 'date', 'name', 'userId'])
+        // amount: any number (Plaid: positive = expense, negative = income)
+        && data.amount is number
+        // date: must be a Firestore Timestamp, not a string
+        && data.date is timestamp
+        // name: non-empty, reasonable max length
+        && data.name is string
+        && data.name.size() > 0
+        && data.name.size() <= 500
+        // userId must match the authenticated caller — prevents cross-user writes
+        && data.userId is string
+        && data.userId == request.auth.uid;
+    }
+
+    // Validates a budget document on create.
+    // NOTE: The codebase stores 'month' (int) and 'year' (int) rather than a
+    // 'period' string. The spec requested 'period' but the validator below
+    // matches the actual iOS data model. If you adopt the v1 backend budget
+    // schema (period_start / period_end), update this validator accordingly.
+    function validBudget(data) {
+      return data.keys().hasAll(['category', 'limit', 'userId'])
+        && data.category is string
+        && data.category.size() > 0
+        && data.category.size() <= 100
+        // limit must be strictly positive — $0 budget is not meaningful
+        && data.limit is number
+        && data.limit > 0
+        && data.userId is string
+        && data.userId == request.auth.uid;
+    }
+
+    // Validates an account document on create.
+    // NOTE: The codebase uses 'institutionName' (string), not 'institutionId'.
+    // The spec requested 'institutionId' but that field is not always available
+    // from Plaid at account creation time. Validate 'name' and 'type' which
+    // are always present, and allow institutionName as optional.
+    function validAccount(data) {
+      return data.keys().hasAll(['name', 'type', 'userId'])
+        && data.name is string
+        && data.name.size() > 0
+        && data.name.size() <= 200
+        // type must be one of the known account types
+        && data.type is string
+        && data.type in ['checking', 'savings', 'credit', 'investment', 'loan', 'other']
+        && data.userId is string
+        && data.userId == request.auth.uid;
+    }
+
+    // ── Advisory rate limiter ────────────────────────────────────────────────
+    //
+    // Checks a server-maintained document at users/{uid}/rate_limit/state:
+    //   { window_start: timestamp, write_count: number }
+    //
+    // The backend (a Cloud Function or Firestore trigger) must:
+    //   1. Increment write_count on each committed write to users/{uid}/**
+    //   2. Reset write_count and update window_start each second
+    //
+    // Without that server-side counter this check always passes (no doc = pass).
+    // For real enforcement use Firebase App Check + Express generalLimiter.
+    //
+    // Window: 1 second, max 10 writes (10 * 1000ms = 10,000ms checked below).
+    // The 1s window is derived from request.time minus the stored window_start.
+    function withinRateLimit(uid) {
+      let ratePath = /databases/$(database)/documents/users/$(uid)/rate_limit/state;
+      // Short-circuit: if no rate limit doc exists, allow (first-time user or
+      // counter not yet initialised — server should create on first write).
+      return !exists(ratePath)
+        // Window has expired → effectively count resets → allow
+        || (request.time.toMillis() - get(ratePath).data.window_start.toMillis()) > 1000
+        // Within window, count is still below the per-second limit
+        || get(ratePath).data.write_count < 10;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // USER DATA RULES
+    // Each collection is listed explicitly. Collections NOT listed here are
+    // denied by Firestore's default-deny policy.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── User profile document ────────────────────────────────────────────────
+    match /users/{uid} {
+      allow read, write: if isOwner(uid) && notOversized();
+    }
+
+    // Profile sub-document (users/{uid}/meta/profile)
+    match /users/{uid}/meta/{docId} {
+      allow read, write: if isOwner(uid) && notOversized();
+    }
+
+    // ── Transactions ─────────────────────────────────────────────────────────
+    match /users/{uid}/transactions/{txnId} {
+      allow read: if isOwner(uid);
+
+      // CREATE: full schema + size + rate limit
+      allow create: if isOwner(uid)
+        && validTransaction(request.resource.data)
+        && notOversized()
+        && withinRateLimit(uid);
+
+      // UPDATE: relaxed — allow partial updates but prevent userId tampering
+      // and enforce size cap. The app patches only changed fields (merge: true).
+      allow update: if isOwner(uid)
+        && request.resource.data.userId == uid
+        && notOversized();
+
+      allow delete: if isOwner(uid);
+    }
+
+    // Transaction splits sub-collection
+    match /users/{uid}/transactions/{txnId}/splits/{splitId} {
+      allow read:             if isOwner(uid);
+      allow create, update:   if isOwner(uid) && notOversized();
+      allow delete:           if isOwner(uid);
+    }
+
+    // ── Budgets ──────────────────────────────────────────────────────────────
+    match /users/{uid}/budgets/{budgetId} {
+      allow read: if isOwner(uid);
+
+      allow create: if isOwner(uid)
+        && validBudget(request.resource.data)
+        && notOversized()
+        && withinRateLimit(uid);
+
+      allow update: if isOwner(uid) && notOversized();
+      allow delete: if isOwner(uid);
+    }
+
+    // Budget lines sub-collection (v1 backend schema)
+    match /users/{uid}/budgets/{budgetId}/lines/{lineId} {
+      allow read:           if isOwner(uid);
+      allow create, update: if isOwner(uid) && notOversized();
+      allow delete:         if isOwner(uid);
+    }
+
+    // Budget rollover events — server-written; clients read-only
+    match /users/{uid}/budgets/{budgetId}/rollover_events/{eventId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // ── Accounts ─────────────────────────────────────────────────────────────
+    match /users/{uid}/accounts/{accountId} {
+      allow read: if isOwner(uid);
+
+      allow create: if isOwner(uid)
+        && validAccount(request.resource.data)
+        && notOversized();
+
+      // Updates come from both client (name/isHidden) and server (balance sync).
+      // Admin SDK bypasses rules so server updates always succeed.
+      allow update: if isOwner(uid) && notOversized();
+      allow delete: if isOwner(uid);
+    }
+
+    // ── Goals ────────────────────────────────────────────────────────────────
+    match /users/{uid}/goals/{goalId} {
+      allow read:           if isOwner(uid);
+      allow create, update: if isOwner(uid) && notOversized();
+      allow delete:         if isOwner(uid);
+    }
+
+    // ── Alert rules ──────────────────────────────────────────────────────────
+    match /users/{uid}/alert_rules/{ruleId} {
+      allow read:           if isOwner(uid);
+      allow create, update: if isOwner(uid) && notOversized();
+      allow delete:         if isOwner(uid);
+    }
+
+    // Alert events — server fires these via Admin SDK.
+    // Clients may READ and ACKNOWLEDGE (set acknowledged_at) but cannot alter
+    // any other field. Uses MapDiff to enforce the field-level restriction.
+    match /users/{uid}/alert_events/{eventId} {
+      allow read: if isOwner(uid);
+      allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['acknowledged_at']);
+      // No create/delete for client → server-only
+    }
+
+    // ── Categories ───────────────────────────────────────────────────────────
+    match /users/{uid}/categories/{categoryId} {
+      allow read:           if isOwner(uid);
+      allow create, update: if isOwner(uid) && notOversized();
+      allow delete:         if isOwner(uid);
+    }
+
+    // ── Recurring entities ───────────────────────────────────────────────────
+    match /users/{uid}/recurring_entities/{entityId} {
+      allow read:           if isOwner(uid);
+      allow create, update: if isOwner(uid) && notOversized();
+      allow delete:         if isOwner(uid);
+    }
+
+    // ── Categorization rules ─────────────────────────────────────────────────
+    match /users/{uid}/rules/{ruleId} {
+      allow read:           if isOwner(uid);
+      allow create, update: if isOwner(uid) && notOversized();
+      allow delete:         if isOwner(uid);
+    }
+
+    // ── Merchant aliases ─────────────────────────────────────────────────────
+    match /users/{uid}/merchant_aliases/{aliasId} {
+      allow read:           if isOwner(uid);
+      allow create, update: if isOwner(uid) && notOversized();
+      allow delete:         if isOwner(uid);
+    }
+
+    // Canonical merchants (server-managed; client read-only)
+    match /users/{uid}/merchants/{merchantId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // ── Consent grants ───────────────────────────────────────────────────────
+    // Written by server on Plaid connection. Client may only read.
+    match /users/{uid}/consent_grants/{grantId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // ── Privacy deletion requests ────────────────────────────────────────────
+    // Client may submit a request (create) and check its status (read).
+    // Cannot modify or cancel once submitted — prevents gaming the system.
+    match /users/{uid}/deletion_requests/{requestId} {
+      allow read:   if isOwner(uid);
+      allow create: if isOwner(uid);
+      // No update/delete rule → immutable after submission
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // SERVER-WRITE-ONLY COLLECTIONS
+    // These are written exclusively via the Firebase Admin SDK (which bypasses
+    // all security rules). Clients have read access to check status/data, but
+    // zero write access. Not listing a write rule is equivalent to denying it.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Plaid access tokens — NEVER accessible to client (no read OR write rule).
+    // Storing raw tokens in Firestore is a known issue (see audit CRIT-2).
+    // Until KMS encryption is implemented this is at minimum client-proof.
+    match /users/{uid}/plaid_tokens/{tokenId} {
+      // Intentionally empty. No rule = full deny from client SDK.
+      // Admin SDK writes succeed regardless.
+    }
+
+    // Bank connections (created by v1/connections.js after Plaid Link)
+    match /users/{uid}/connections/{connectionId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // Investment holdings (synced by server from Plaid Investments)
+    match /users/{uid}/holdings/{holdingId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // AI insight snapshots (generated by /v1/insights/monthly)
+    match /users/{uid}/insight_snapshots/{month} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // Cashflow summaries (cached by /v1/reports/cashflow)
+    match /users/{uid}/cashflow_summaries/{month} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // Net worth snapshots (written by /v1/reports/networth)
+    match /users/{uid}/networth_snapshots/{snapshotId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // Background job status documents
+    match /users/{uid}/refresh_jobs/{jobId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    match /users/{uid}/bulk_edit_jobs/{jobId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    match /users/{uid}/export_jobs/{jobId} {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // Rate limit state — server-maintained counter used by withinRateLimit().
+    // Must be written by a Cloud Function / Firestore trigger, not by the client.
+    match /users/{uid}/rate_limit/state {
+      allow read: if isOwner(uid);
+      // No write rule → client writes denied
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // TOP-LEVEL SERVER-ONLY COLLECTIONS
+    // Not listed under /users/{uid}/ — clients must never access these.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // item_id → uid mapping used by the webhook handler.
+    // Written by Admin SDK; must be invisible to all clients.
+    match /plaid_item_index/{itemId} {
+      // Intentionally empty. Full deny from client SDK.
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // CATCH-ALL DENY
+    //
+    // Firestore already denies all paths by default (no rule = no access).
+    // This explicit block makes the intent visible in code review and confirms
+    // that no accidental wildcard above has granted unexpected access.
+    //
+    // NOTE: Because Firestore rules are OR-based (any matching ALLOW wins),
+    // this block never overrides a rule above that grants access. It is purely
+    // declarative — it signals "we intended to deny everything else."
+    // ═════════════════════════════════════════════════════════════════════════
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
