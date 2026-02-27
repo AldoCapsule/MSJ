@@ -1,9 +1,9 @@
+'use strict';
 const express = require('express');
 const router = express.Router();
-const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
 const { verifyFirebaseToken } = require('../../middleware/auth');
-
-const db = () => admin.firestore();
+const { supabaseForUser } = require('../../db');
 
 // Default system categories seeded on first call if missing
 const SYSTEM_CATEGORIES = [
@@ -28,38 +28,35 @@ const SYSTEM_CATEGORIES = [
 
 router.use(verifyFirebaseToken);
 
-// Seed system categories for a new user if collection is empty
-async function ensureSystemCategories(uid) {
-  const col = db().collection('users').doc(uid).collection('categories');
-  const existing = await col.where('is_system', '==', true).limit(1).get();
-  if (!existing.empty) return;
+async function ensureSystemCategories(accessToken, uid) {
+  const { data } = await supabaseForUser(accessToken)
+    .from('categories')
+    .select('id')
+    .eq('is_system', true)
+    .limit(1);
+  if (data && data.length > 0) return;
 
-  const batch = db().batch();
-  for (const cat of SYSTEM_CATEGORIES) {
-    const ref = col.doc();
-    batch.set(ref, {
-      id: ref.id,
-      user_id: uid,
-      parent_id: null,
-      is_system: true,
-      is_hidden: false,
-      created_at: admin.firestore.FieldValue.serverTimestamp(),
-      ...cat,
-    });
-  }
-  await batch.commit();
+  const rows = SYSTEM_CATEGORIES.map(cat => ({
+    id: uuidv4(),
+    user_id: uid,
+    parent_id: null,
+    is_system: true,
+    is_hidden: false,
+    ...cat,
+  }));
+  await supabaseForUser(accessToken).from('categories').insert(rows);
 }
 
 // GET /v1/categories
 router.get('/', async (req, res, next) => {
   try {
-    await ensureSystemCategories(req.uid);
-    const snap = await db().collection('users').doc(req.uid)
-      .collection('categories')
-      .orderBy('name')
-      .get();
-    const categories = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.json({ categories });
+    await ensureSystemCategories(req.accessToken, req.uid);
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('categories')
+      .select('*')
+      .order('name');
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ categories: data });
   } catch (err) {
     console.error('[CATEGORIES] GET error:', err.message);
     next({ status: 500, message: 'Failed to fetch categories' });
@@ -76,21 +73,23 @@ router.post('/', async (req, res, next) => {
     return res.status(400).json({ error: 'type must be income, expense, or transfer' });
   }
   try {
-    const ref = db().collection('users').doc(req.uid).collection('categories').doc();
-    const category = {
-      id: ref.id,
-      user_id: req.uid,
-      name,
-      parent_id: parent_id || null,
-      type,
-      is_system: false,
-      is_hidden: is_hidden || false,
-      icon: icon || 'tag.fill',
-      color: color || '#868E96',
-      created_at: admin.firestore.FieldValue.serverTimestamp(),
-    };
-    await ref.set(category);
-    res.status(201).json({ category });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('categories')
+      .insert({
+        id: uuidv4(),
+        user_id: req.uid,
+        name,
+        parent_id: parent_id || null,
+        type,
+        is_system: false,
+        is_hidden: is_hidden || false,
+        icon: icon || 'tag.fill',
+        color: color || '#868E96',
+      })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.status(201).json({ category: data });
   } catch (err) {
     console.error('[CATEGORIES] POST error:', err.message);
     next({ status: 500, message: 'Failed to create category' });
@@ -100,17 +99,20 @@ router.post('/', async (req, res, next) => {
 // PATCH /v1/categories/:id
 router.patch('/:id', async (req, res, next) => {
   try {
-    const ref = db().collection('users').doc(req.uid).collection('categories').doc(req.params.id);
-    const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ error: 'Category not found' });
-
-    const updates = {};
     const allowed = ['name', 'parent_id', 'type', 'is_hidden', 'icon', 'color'];
+    const updates = { updated_at: new Date().toISOString() };
     for (const key of allowed) {
       if (req.body[key] !== undefined) updates[key] = req.body[key];
     }
-    await ref.update({ ...updates, updated_at: admin.firestore.FieldValue.serverTimestamp() });
-    res.json({ category: { id: snap.id, ...snap.data(), ...updates } });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('categories')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error?.code === 'PGRST116') return res.status(404).json({ error: 'Category not found' });
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ category: data });
   } catch (err) {
     console.error('[CATEGORIES] PATCH error:', err.message);
     next({ status: 500, message: 'Failed to update category' });
@@ -120,11 +122,20 @@ router.patch('/:id', async (req, res, next) => {
 // DELETE /v1/categories/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const ref = db().collection('users').doc(req.uid).collection('categories').doc(req.params.id);
-    const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ error: 'Category not found' });
-    if (snap.data().is_system) return res.status(403).json({ error: 'Cannot delete system categories' });
-    await ref.delete();
+    const { data, error: fetchErr } = await supabaseForUser(req.accessToken)
+      .from('categories')
+      .select('is_system')
+      .eq('id', req.params.id)
+      .single();
+    if (fetchErr?.code === 'PGRST116') return res.status(404).json({ error: 'Category not found' });
+    if (fetchErr) return res.status(500).json({ error: 'Database error' });
+    if (data.is_system) return res.status(403).json({ error: 'Cannot delete system categories' });
+
+    const { error } = await supabaseForUser(req.accessToken)
+      .from('categories')
+      .delete()
+      .eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: 'Database error' });
     res.json({ success: true });
   } catch (err) {
     console.error('[CATEGORIES] DELETE error:', err.message);
