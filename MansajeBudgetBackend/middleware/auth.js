@@ -1,27 +1,27 @@
-const admin = require('firebase-admin');
+'use strict';
+const { createClient } = require('@supabase/supabase-js');
 
-/**
- * Middleware: verify Firebase ID token from Authorization header.
- * Sets req.uid on success.
- */
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing Authorization header' });
+  }
+  const token = authHeader.slice(7);
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
   }
 
-  const idToken = authHeader.split('Bearer ')[1];
-
-  try {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    req.uid = decodedToken.uid;
-    req.email = decodedToken.email;
-    next();
-  } catch (error) {
-    console.error('[AUTH] Token verification failed:', error.message);
-    return res.status(401).json({ error: 'Unauthorized: invalid or expired token' });
-  }
+  req.uid = user.id;
+  req.accessToken = token;
+  next();
 }
 
+// Exported as verifyFirebaseToken so all route imports need zero changes
 module.exports = { verifyFirebaseToken };
