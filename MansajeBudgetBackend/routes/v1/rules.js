@@ -1,9 +1,9 @@
+'use strict';
 const express = require('express');
 const router = express.Router();
-const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
 const { verifyFirebaseToken } = require('../../middleware/auth');
-
-const db = () => admin.firestore();
+const { supabaseForUser } = require('../../db');
 
 router.use(verifyFirebaseToken);
 
@@ -24,22 +24,24 @@ router.post('/', async (req, res, next) => {
     }
   }
   try {
-    const ref = db().collection('users').doc(req.uid).collection('rules').doc();
-    const rule = {
-      id: ref.id,
-      user_id: req.uid,
-      priority: priority || 100,
-      match_type,
-      match_value,
-      action_category_id,
-      action_tags: action_tags || [],
-      apply_scope: apply_scope || 'new_only',
-      enabled: enabled !== false,
-      last_applied_at: null,
-      created_at: admin.firestore.FieldValue.serverTimestamp(),
-    };
-    await ref.set(rule);
-    res.status(201).json({ rule });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('rules')
+      .insert({
+        id: uuidv4(),
+        user_id: req.uid,
+        priority: priority || 100,
+        match_type,
+        match_value,
+        action_category_id,
+        action_tags: action_tags || [],
+        apply_scope: apply_scope || 'new_only',
+        enabled: enabled !== false,
+        last_applied_at: null,
+      })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.status(201).json({ rule: data });
   } catch (err) {
     console.error('[RULES] POST error:', err.message);
     next({ status: 500, message: 'Failed to create rule' });
@@ -49,9 +51,12 @@ router.post('/', async (req, res, next) => {
 // GET /v1/rules
 router.get('/', async (req, res, next) => {
   try {
-    const snap = await db().collection('users').doc(req.uid).collection('rules')
-      .orderBy('priority').get();
-    res.json({ rules: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('rules')
+      .select('*')
+      .order('priority');
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ rules: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to fetch rules' });
   }
@@ -60,17 +65,20 @@ router.get('/', async (req, res, next) => {
 // PATCH /v1/rules/:id
 router.patch('/:id', async (req, res, next) => {
   try {
-    const ref = db().collection('users').doc(req.uid).collection('rules').doc(req.params.id);
-    const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ error: 'Rule not found' });
-
     const allowed = ['priority', 'match_type', 'match_value', 'action_category_id', 'action_tags', 'apply_scope', 'enabled'];
-    const updates = { updated_at: admin.firestore.FieldValue.serverTimestamp() };
+    const updates = { updated_at: new Date().toISOString() };
     for (const key of allowed) {
       if (req.body[key] !== undefined) updates[key] = req.body[key];
     }
-    await ref.update(updates);
-    res.json({ rule: { id: snap.id, ...snap.data(), ...updates } });
+    const { data, error } = await supabaseForUser(req.accessToken)
+      .from('rules')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error?.code === 'PGRST116') return res.status(404).json({ error: 'Rule not found' });
+    if (error) return res.status(500).json({ error: 'Database error' });
+    res.json({ rule: data });
   } catch (err) {
     next({ status: 500, message: 'Failed to update rule' });
   }
@@ -79,18 +87,22 @@ router.patch('/:id', async (req, res, next) => {
 // POST /v1/rules/:id/apply — retroactively apply a rule to existing transactions
 router.post('/:id/apply', async (req, res, next) => {
   try {
-    const ruleSnap = await db().collection('users').doc(req.uid).collection('rules').doc(req.params.id).get();
-    if (!ruleSnap.exists) return res.status(404).json({ error: 'Rule not found' });
-    const rule = ruleSnap.data();
+    const { data: rule, error: ruleErr } = await supabaseForUser(req.accessToken)
+      .from('rules')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+    if (ruleErr?.code === 'PGRST116') return res.status(404).json({ error: 'Rule not found' });
+    if (ruleErr) return res.status(500).json({ error: 'Database error' });
 
-    const txnsSnap = await db().collection('users').doc(req.uid).collection('transactions').get();
-    const txns = txnsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const { data: txns, error: txnErr } = await supabaseForUser(req.accessToken)
+      .from('transactions')
+      .select('id, name, raw_description, account_id');
+    if (txnErr) return res.status(500).json({ error: 'Database error' });
 
-    const batch = db().batch();
-    let matchCount = 0;
-
-    for (const txn of txns) {
-      const name = (txn.name || txn.rawDescription || '').toLowerCase();
+    const matchedIds = [];
+    for (const txn of (txns || [])) {
+      const name = (txn.name || txn.raw_description || '').toLowerCase();
       let matched = false;
 
       if (rule.match_type === 'merchant') {
@@ -98,21 +110,30 @@ router.post('/:id/apply', async (req, res, next) => {
       } else if (rule.match_type === 'regex') {
         try { matched = new RegExp(rule.match_value, 'i').test(name); } catch { /* skip */ }
       } else if (rule.match_type === 'account') {
-        matched = txn.accountId === rule.match_value;
+        matched = txn.account_id === rule.match_value;
       }
 
-      if (matched) {
-        const txnRef = db().collection('users').doc(req.uid).collection('transactions').doc(txn.id);
-        batch.update(txnRef, { categoryId: rule.action_category_id, category: rule.action_category_id,
-          updated_at: admin.firestore.FieldValue.serverTimestamp() });
-        matchCount++;
-      }
+      if (matched) matchedIds.push(txn.id);
     }
 
-    if (matchCount > 0) await batch.commit();
-    await ruleSnap.ref.update({ last_applied_at: admin.firestore.FieldValue.serverTimestamp() });
+    if (matchedIds.length > 0) {
+      const { error: updateErr } = await supabaseForUser(req.accessToken)
+        .from('transactions')
+        .update({
+          category_id: rule.action_category_id,
+          category: rule.action_category_id,
+          updated_at: new Date().toISOString(),
+        })
+        .in('id', matchedIds);
+      if (updateErr) return res.status(500).json({ error: 'Database error' });
+    }
 
-    res.json({ applied_to: matchCount });
+    await supabaseForUser(req.accessToken)
+      .from('rules')
+      .update({ last_applied_at: new Date().toISOString() })
+      .eq('id', req.params.id);
+
+    res.json({ applied_to: matchedIds.length });
   } catch (err) {
     console.error('[RULES] apply error:', err.message);
     next({ status: 500, message: 'Failed to apply rule' });
