@@ -1,11 +1,11 @@
+'use strict';
 const express = require('express');
 const router = express.Router();
-const admin = require('firebase-admin');
 const Anthropic = require('@anthropic-ai/sdk');
 const { verifyFirebaseToken } = require('../../middleware/auth');
+const { supabaseForUser } = require('../../db');
 const { heavyLimiter } = require('../../middleware/rateLimiter');
 
-const db = () => admin.firestore();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 router.use(verifyFirebaseToken);
@@ -15,50 +15,61 @@ router.use(heavyLimiter);
 router.get('/monthly', async (req, res, next) => {
   try {
     const { month } = req.query;
-    const targetMonth = month || `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+    const targetMonth = month ||
+      `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
     const [year, mon] = targetMonth.split('-').map(Number);
 
-    // Check cache first
-    const cacheRef = db().collection('users').doc(req.uid).collection('insight_snapshots').doc(targetMonth);
-    const cached = await cacheRef.get();
-    if (cached.exists) {
-      return res.json({ insight: { month: targetMonth, ...cached.data() } });
-    }
+    // Check cache first (unique on user_id + month)
+    const { data: cached } = await supabaseForUser(req.accessToken)
+      .from('insight_snapshots')
+      .select('*')
+      .eq('month', targetMonth)
+      .maybeSingle();
+    if (cached) return res.json({ insight: cached });
 
-    // Fetch current month transactions
-    const start = new Date(year, mon - 1, 1);
-    const end = new Date(year, mon, 1);
-    const snap = await db().collection('users').doc(req.uid).collection('transactions')
-      .where('date', '>=', start).where('date', '<', end).get();
-    const txns = snap.docs.map(d => d.data()).filter(t => !t.isTransfer && !t.isHidden);
+    const start = new Date(year, mon - 1, 1).toISOString().slice(0, 10);
+    const end = new Date(year, mon, 1).toISOString().slice(0, 10);
 
-    if (txns.length === 0) {
-      return res.json({ insight: { month: targetMonth, summary: 'No transactions found for this month.',
+    const { data: txns, error: txnErr } = await supabaseForUser(req.accessToken)
+      .from('transactions')
+      .select('amount, category, category_id, is_transfer, is_hidden, date')
+      .gte('date', start)
+      .lt('date', end)
+      .eq('is_transfer', false)
+      .eq('is_hidden', false);
+    if (txnErr) return res.status(500).json({ error: 'Database error' });
+
+    if (!txns || txns.length === 0) {
+      return res.json({ insight: { month: targetMonth,
+        summary: 'No transactions found for this month.',
         anomalies: [], top_categories: [], generated_at: new Date() } });
     }
 
-    // Fetch prior month for comparison
-    const prevStart = new Date(year, mon - 2, 1);
-    const prevSnap = await db().collection('users').doc(req.uid).collection('transactions')
-      .where('date', '>=', prevStart).where('date', '<', start).get();
-    const prevTxns = prevSnap.docs.map(d => d.data()).filter(t => !t.isTransfer && !t.isHidden);
+    // Prior month for comparison
+    const prevStart = new Date(year, mon - 2, 1).toISOString().slice(0, 10);
+    const { data: prevTxns } = await supabaseForUser(req.accessToken)
+      .from('transactions')
+      .select('amount, category, category_id, is_transfer, is_hidden')
+      .gte('date', prevStart)
+      .lt('date', start)
+      .eq('is_transfer', false)
+      .eq('is_hidden', false);
 
-    // Build metrics
     const income = txns.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
     const expenses = txns.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
-    const prevExpenses = prevTxns.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
+    const prevExpenses = (prevTxns || []).filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
 
     const byCat = {};
     for (const t of txns.filter(t => t.amount > 0)) {
-      const cat = t.categoryId || t.category || 'other';
+      const cat = t.category_id || t.category || 'other';
       byCat[cat] = (byCat[cat] || 0) + t.amount;
     }
     const topCats = Object.entries(byCat).sort(([, a], [, b]) => b - a).slice(0, 5)
       .map(([cat, amount]) => ({ category: cat, amount: Math.round(amount * 100) / 100 }));
 
     const prevByCat = {};
-    for (const t of prevTxns.filter(t => t.amount > 0)) {
-      const cat = t.categoryId || t.category || 'other';
+    for (const t of (prevTxns || []).filter(t => t.amount > 0)) {
+      const cat = t.category_id || t.category || 'other';
       prevByCat[cat] = (prevByCat[cat] || 0) + t.amount;
     }
 
@@ -82,10 +93,8 @@ Transaction count: ${txns.length}
         content: `You are a personal finance assistant. Analyze this user's monthly spending data and provide a brief, friendly, actionable insight summary (3-4 sentences max). Highlight the most notable pattern, any concerning change, and one concrete suggestion. Do not use dollar signs in headings. Keep it conversational.\n\n${metricsText}`,
       }],
     });
-
     const summary = message.content[0].type === 'text' ? message.content[0].text : '';
 
-    // Detect anomalies: category spending > 2x prior month
     const anomalies = [];
     for (const [cat, amount] of Object.entries(byCat)) {
       const prev = prevByCat[cat] || 0;
@@ -96,19 +105,25 @@ Transaction count: ${txns.length}
     }
 
     const insight = {
+      user_id: req.uid,
       month: targetMonth,
       summary,
       income_total: Math.round(income * 100) / 100,
       expense_total: Math.round(expenses * 100) / 100,
       net_total: Math.round((income - expenses) * 100) / 100,
-      mom_change_pct: prevExpenses > 0 ? Math.round((expenses - prevExpenses) / prevExpenses * 1000) / 10 : null,
+      mom_change_pct: prevExpenses > 0
+        ? Math.round((expenses - prevExpenses) / prevExpenses * 1000) / 10 : null,
       top_categories: topCats,
       anomalies,
-      generated_at: admin.firestore.FieldValue.serverTimestamp(),
+      generated_at: new Date().toISOString(),
     };
 
-    await cacheRef.set(insight);
-    res.json({ insight: { ...insight, generated_at: new Date() } });
+    // Upsert with unique(user_id, month)
+    await supabaseForUser(req.accessToken)
+      .from('insight_snapshots')
+      .upsert(insight, { onConflict: 'user_id,month' });
+
+    res.json({ insight });
   } catch (err) {
     console.error('[INSIGHTS] error:', err.message);
     next({ status: 500, message: 'Failed to generate insights' });
