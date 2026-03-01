@@ -1,5 +1,2 @@
-import HomeScreen from '@/screens/HomeScreen'
-
-export default function Page() {
-  return <HomeScreen />
-}
+import { redirect } from 'next/navigation'
+export default function Page() { redirect('/dashboard') }

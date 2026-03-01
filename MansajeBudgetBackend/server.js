@@ -69,6 +69,7 @@ app.use('/v1/investments',   require('./routes/v1/investments'));
 app.use('/v1/rules',         require('./routes/v1/rules'));
 app.use('/v1/wealth',        require('./routes/v1/wealth'));
 app.use('/v1/goals/:goalId', require('./routes/v1/wealth')); // milestone sub-routes
+app.use('/v1/retirement',    require('./routes/v1/retirement'));
 
 // ── Health check ────────────────────────────────────────────────
 app.get('/health', (req, res) => {

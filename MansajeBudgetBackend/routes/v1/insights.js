@@ -11,6 +11,19 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 router.use(verifyFirebaseToken);
 router.use(heavyLimiter);
 
+// GET /v1/insights — list cached monthly insights (most recent 6 months)
+router.get('/', async (req, res, next) => {
+  try {
+    const snap = await db().collection('users').doc(req.uid).collection('insight_snapshots')
+      .orderBy('month', 'desc').limit(6).get();
+    const insights = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json({ insights });
+  } catch (err) {
+    console.error('[INSIGHTS] list error:', err.message);
+    next({ status: 500, message: 'Failed to fetch insights' });
+  }
+});
+
 // GET /v1/insights/monthly?month=YYYY-MM
 router.get('/monthly', async (req, res, next) => {
   try {

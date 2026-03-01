@@ -7,6 +7,21 @@ const supabase = createClient(
 );
 
 async function verifyFirebaseToken(req, res, next) {
+  // ── Dev bypass ─────────────────────────────────────────────────
+  // When DEV_USER_ID is set in non-production, unauthenticated requests are
+  // granted access as that user. Uses the service role key as the access token
+  // so supabaseForUser() calls still work (RLS bypassed in dev — acceptable).
+  if (process.env.NODE_ENV !== 'production' && process.env.DEV_USER_ID) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      req.uid = process.env.DEV_USER_ID;
+      req.accessToken = process.env.SUPABASE_SERVICE_ROLE_KEY;
+      console.log(`[AUTH] Dev bypass active — uid: ${req.uid}`);
+      return next();
+    }
+  }
+
+  // ── Production: verify Supabase JWT ────────────────────────────
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Missing Authorization header' });
